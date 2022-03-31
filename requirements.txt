@@ -1,7 +1,4 @@
-hyper>=0.7.0
 numpy>=1.10.0
 Orange3>=3.21.0
-requests
-cachecontrol
 rdkit-pypi
 orange3-imageanalytics>=0.7.0
