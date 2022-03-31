@@ -1,21 +1,12 @@
 import logging
-import random
-import uuid
-from itertools import islice
-from os.path import join, isfile
-from AnyQt.QtCore import QSettings
-
-import cachecontrol.caches
+from Orange.misc.utils.embedder_utils import EmbedderCache
+from concurrent.futures import CancelledError
+from typing import overload, Sequence, Optional, Callable, Union, Tuple
 import numpy as np
-import requests
 
-from Orange.data import ContinuousVariable, Domain, Table
-from Orange.misc.environ import cache_dir
 
-from orangecontrib.chem.http2_client import Http2Client
-from orangecontrib.chem.http2_client import MaxNumberOfRequestsError
-from orangecontrib.chem.utils import md5_hash
-from orangecontrib.chem.utils import save_pickle, load_pickle
+from Orange.data import ContinuousVariable, Domain, Table, StringVariable
+from Orange.misc.server_embedder import ServerEmbedderCommunicator
 
 log = logging.getLogger(__name__)
 
@@ -25,79 +16,77 @@ MODELS = {
         'name': 'CNN-Based SMILES Embedder',
         'description': 'CNN model trained on Pharmacologic Action MeSH terms classification',
         'target_smiles_length': 1021,
+        'batch_size': 500,  # ??
+        'is_local': False,
         'layers': ['penultimate'],
         'order': 0
     },
 }
 
 
-class EmbeddingCancelledException(Exception):
+class ServerEmbedder(ServerEmbedderCommunicator):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.content_type = 'text/plain'
+
+    async def _encode_data_instance(self, data_instance: str) -> bytes:
+        """
+        This is just an implementation for test purposes. We just return
+        a sample bytes which is id encoded to bytes.
+        """
+        return data_instance.encode('utf-8')
+
+
+class EmbeddingCancelledException(CancelledError):
     """Thrown when the embedding task is cancelled from another thread.
     (i.e. MoleculeEmbedder.cancelled attribute is set to True).
     """
 
 
-class MoleculeEmbedder(Http2Client):
-    """"Client side functionality for accessing a remote http2
-    molecule embedding backend.
-
+class MoleculeEmbedder:
     """
-    _cache_file_blueprint = '{:s}_{:s}_embeddings.pickle'
-    MAX_REPEATS = 4
-    CANNOT_LOAD = "cannot load"
+    Client side functionality for accessing a remote molecule embedding
+    backend.
+    """
+    _embedder = None
 
-    def __init__(self, model="smiles", layer="penultimate",
-                 server_url='api.garaza.io:443'):
-        super().__init__(server_url)
-        model_settings = self._get_model_settings_confidently(model, layer)
-        self._model = model
-        self._layer = layer
-        self._target_smiles_length = model_settings['target_smiles_length']
+    def __init__(self, model="smiles", server_url='https://api.garaza.io/'):
+        self.model = model
+        self.server_url = server_url
+        self._model_settings = self._get_model_settings_confidently()
 
-        cache_file_path = self._cache_file_blueprint.format(model, layer)
-        self._cache_file_path = join(cache_dir(), cache_file_path)
-        self._cache_dict = self._init_cache()
-
-        self._session = cachecontrol.CacheControl(
-            requests.session(),
-            cache=cachecontrol.caches.FileCache(
-                join(cache_dir(), __name__ + ".MoleculeEmbedder.httpcache"))
-        )
-
-        # attribute that offers support for cancelling the embedding
-        # if ran in another thread
-        self.cancelled = False
-        self.machine_id = \
-            QSettings().value('error-reporting/machine-id', '', type=str)  \
-            or str(uuid.getnode())
-        self.session_id = None
-
-    @staticmethod
-    def _get_model_settings_confidently(model, layer):
-        if model not in MODELS.keys():
+    def _get_model_settings_confidently(self):
+        if self.model not in MODELS.keys():
             model_error = "'{:s}' is not a valid model, should be one of: {:s}"
             available_models = ', '.join(MODELS.keys())
-            raise ValueError(model_error.format(model, available_models))
+            raise ValueError(model_error.format(self.model, available_models))
 
-        model_settings = MODELS[model]
+        return MODELS[self.model]
 
-        if layer not in model_settings['layers']:
-            layer_error = (
-                "'{:s}' is not a valid layer for the '{:s}'"
-                " model, should be one of: {:s}")
-            available_layers = ', '.join(model_settings['layers'])
-            raise ValueError(layer_error.format(layer, model, available_layers))
+    def is_local_embedder(self) -> bool:
+        """
+        Tells whether selected embedder is local or not.
+        """
+        return self._model_settings.get("is_local", False)
 
-        return model_settings
+    def _init_embedder(self) -> None:
+        """
+        Init local or server embedder.
+        """
+        if self.is_local_embedder():
+            self._embedder = LocalEmbedder(self.model, self._model_settings)
+        else:
+            self._embedder = ServerEmbedder(
+                self.model,
+                self._model_settings["batch_size"],
+                self.server_url,
+                "chem",
+            )
 
-    def _init_cache(self):
-        if isfile(self._cache_file_path):
-            try:
-                return load_pickle(self._cache_file_path)
-            except EOFError:
-                return {}
-
-        return {}
+    @overload
+    def __call__(self, /, smiles: Sequence[str], *, callback: Optional[Callable] = None) -> Sequence[str]: ...
+    @overload
+    def __call__(self, /, data: Table, col: Union[str, StringVariable], *, callback: Optional[Callable] = None) -> Table: ...
 
     def __call__(self, *args, **kwargs):
         if len(args) and isinstance(args[0], Table) or \
@@ -109,12 +98,12 @@ class MoleculeEmbedder(Http2Client):
         else:
             raise TypeError
 
-    def from_table(self, data, col="SMILES", smiles_processed_callback=None):  # !!
+    def from_table(self, data: Table, col="SMILES", callback=None):
         smiles = data[:, col].metas.flatten()
-        embeddings = self.from_smiles(smiles, smiles_processed_callback)
+        embeddings = self.from_smiles(smiles, callback)
         return MoleculeEmbedder.prepare_output_data(data, embeddings)
 
-    def from_smiles(self, smiles, smiles_processed_callback=None):
+    def from_smiles(self, smiles: Sequence[str], callback=None):
         """Send the smiles to the remote server in batches. The batch size
         parameter is set by the http2 remote peer (i.e. the server).
 
@@ -123,7 +112,7 @@ class MoleculeEmbedder(Http2Client):
         smiles: list
             A list of smiles for moelcules to be embedded.
 
-        smiles_processed_callback: callable (default=None)
+        callback: callable (default=None)
             A function that is called after each smiles is fully processed
             by either getting a successful response from the server,
             getting the result from cache or skipping the smiles.
@@ -143,182 +132,17 @@ class MoleculeEmbedder(Http2Client):
         EmbeddingCancelledException:
             If cancelled attribute is set to True (default=False).
         """
-        if not self.is_connected_to_server():
-            self.reconnect_to_server()
-
-        self.session_id = str(random.randint(1, 1e10))
-        all_embeddings = [None] * len(smiles)
-        repeats_counter = 0
-
-        # repeat while all smiles has embeddings or
-        # while counter counts out (prevents cycling)
-        while len([el for el in all_embeddings if el is None]) > 0 and \
-            repeats_counter < self.MAX_REPEATS:
-
-            # take all smiles without embeddings yet
-            selected_indices = [i for i, v in enumerate(all_embeddings)
-                                if v is None]
-            smiles_wo_emb = [(smiles[i], i) for i in selected_indices]
-
-            for batch in self._yield_in_batches(smiles_wo_emb):
-                b_smiles, b_indices = zip(*batch)
-                try:
-                    embeddings = self._send_to_server(
-                        b_smiles, smiles_processed_callback, repeats_counter
-                    )
-                except MaxNumberOfRequestsError:
-                    # maximum number of http2 requests through a single
-                    # connection is exceeded and a remote peer has closed
-                    # the connection so establish a new connection and retry
-                    # with the same batch (should happen rarely as the setting
-                    # is usually set to >= 1000 requests in http2)
-                    self.reconnect_to_server()
-                    embeddings = [None] * len(batch)
-
-                # insert embeddings into the list
-                for i, emb in zip(b_indices, embeddings):
-                    all_embeddings[i] = emb
-
-                self.persist_cache()
-            repeats_counter += 1
-
-        # # change smiles that were not loaded from 'cannot loaded' to None
-        all_embeddings = \
-            [None if not isinstance(el, np.ndarray) and el == self.CANNOT_LOAD
-             else el for el in all_embeddings]
-
-        return np.array(all_embeddings)
-
-    def _yield_in_batches(self, list_):
-        gen_ = (s for s in list_)
-        batch_size = self._max_concurrent_streams
-
-        num_yielded = 0
-
-        while True:
-            batch = list(islice(gen_, batch_size))
-            num_yielded += len(batch)
-
-            yield batch
-
-            if num_yielded == len(list_):
-                return
-
-    def _send_to_server(self, smiles_list, smiles_processed_callback, retry_n):
-        """ Load smiles and compute cache keys and send requests to
-        an http2 server for valid ones.
-        """
-        cache_keys = []
-        http_streams = []
-
-        for smiles in smiles_list:
-            if self.cancelled:
-                raise EmbeddingCancelledException()
-
-            if not smiles:
-                # skip the sending because smiles was skipped at loading
-                http_streams.append(None)
-                cache_keys.append(None)
-                continue
-
-            cache_key = md5_hash(smiles.encode('utf-8'))
-            cache_keys.append(cache_key)
-            if cache_key in self._cache_dict:
-                # skip the sending because smiles is present in the
-                # local cache
-                http_streams.append(None)
-                continue
-
-            try:
-                headers = {
-                    'Content-Type': 'text/plain',
-                    'Content-Length': str(len(smiles))
-                }
-                stream_id = self._send_request(
-                    method='POST',
-                    url='/chem/' + self._model +
-                        '?machine={}&session={}&retry={}'
-                        .format(self.machine_id, self.session_id, retry_n),
-                    headers=headers,
-                    body_bytes=smiles.encode('utf-8')
-                )
-                http_streams.append(stream_id)
-            except ConnectionError:
-                self.persist_cache()
-                raise
-
-        # wait for the responses in a blocking manner
-        return self._get_responses_from_server(
-            http_streams,
-            cache_keys,
-            smiles_processed_callback
-        )
-
-    def _get_responses_from_server(self, http_streams, cache_keys,
-                                   smiles_processed_callback):
-        """Wait for responses from an http2 server in a blocking manner."""
-        embeddings = []
-
-        for stream_id, cache_key in zip(http_streams, cache_keys):
-            if self.cancelled:
-                raise EmbeddingCancelledException()
-
-            if not stream_id and not cache_key:
-                # when smiles cannot be loaded
-                embeddings.append(self.CANNOT_LOAD)
-
-                if smiles_processed_callback:
-                    smiles_processed_callback(success=False)
-                continue
-
-            if not stream_id:
-                # skip rest of the waiting because smiles was either
-                # skipped at loading or is present in the local cache
-                embedding = self._get_cached_result_or_none(cache_key)
-                embeddings.append(embedding)
-
-                if smiles_processed_callback:
-                    smiles_processed_callback(success=embedding is not None)
-                continue
-
-            try:
-                response = self._get_json_response_or_none(stream_id)
-            except ConnectionError:
-                self.persist_cache()
-                raise
-
-            if not response or 'embedding' not in response:
-                # returned response is not a valid json response
-                # or the embedding key not present in the json
-                embeddings.append(None)
-            else:
-                # successful response
-                embedding = np.array(response['embedding'], dtype=np.float16)
-                embeddings.append(embedding)
-                self._cache_dict[cache_key] = embedding
-
-            if smiles_processed_callback:
-                smiles_processed_callback(embeddings[-1] is not None)
-
-        return embeddings
-
-    def _get_cached_result_or_none(self, cache_key):
-        if cache_key in self._cache_dict:
-            return self._cache_dict[cache_key]
-        return None
+        self._init_embedder()
+        return self._embedder.embedd_data(smiles, processed_callback=callback)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exception_type, exception_value, traceback):
-        self.disconnect_from_server()
+        self.set_canceled()
 
-    def clear_cache(self):
-        self._cache_dict = {}
-        self.persist_cache()
-
-    def persist_cache(self):
-        save_pickle(self._cache_dict, self._cache_file_path)
+    def __del__(self) -> None:
+        self.__exit__(None, None, None)
 
     @staticmethod
     def construct_output_data_table(embedded_smiles, embeddings):
@@ -338,7 +162,10 @@ class MoleculeEmbedder(Http2Client):
         return Table(domain, X, Y, embedded_smiles.metas)
 
     @staticmethod
-    def prepare_output_data(input_data, embeddings):
+    def prepare_output_data(
+            input_data,
+            embeddings: Sequence[Optional[Sequence[float]]]
+    ) -> Tuple[Table, Table, int]:
         skipped_smiles_bool = np.array([x is None for x in embeddings])
 
         if np.any(skipped_smiles_bool):
@@ -355,8 +182,10 @@ class MoleculeEmbedder(Http2Client):
         if np.any(embedded_smiles_bool):
             embedded_smiles = input_data[embedded_smiles_bool]
 
-            embeddings = embeddings[embedded_smiles_bool]
-            embeddings = np.stack(embeddings)
+            embeddings = [
+                e for e, b in zip(embeddings, embedded_smiles_bool) if b
+            ]
+            embeddings = np.vstack(embeddings)
 
             embedded_smiles = MoleculeEmbedder.construct_output_data_table(
                 embedded_smiles,
@@ -372,3 +201,39 @@ class MoleculeEmbedder(Http2Client):
     def filter_string_attributes(data):
         metas = data.domain.metas
         return [m for m in metas if m.is_string]
+
+    def clear_cache(self) -> None:
+        """
+        Function clear cache for the selected embedder. If embedder is loaded
+        cache is cleaned from its dict otherwise we load cache and clean it
+        from file.
+        """
+        if self._embedder:
+            # embedder is loaded so we clean its cache
+            self._embedder.clear_cache()
+        else:
+            # embedder is not initialized yet - clear it cache from file
+            cache = EmbedderCache(self.model)
+            cache.clear_cache()
+
+    def set_canceled(self) -> None:
+        """
+        Cancel the embedding
+        """
+        if self._embedder is not None:
+            self._embedder.set_cancelled()
+
+
+if __name__ == "__main__":
+    em = ServerEmbedder(
+        model_name="smiles",
+        max_parallel_requests=500,
+        server_url="https://api.garaza.io/",
+        embedder_type="chem"
+    )
+    print(em.embedd_data([
+        "C(=O)[C@H](CCCCNC(=O)OCCOC)NC(=O)OCCOC",
+        "OCC",
+        "CCCCNC(=O)OCNC(=O)OCCOC",
+        "H2O"
+    ]))
