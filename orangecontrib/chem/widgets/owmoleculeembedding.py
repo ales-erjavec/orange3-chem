@@ -17,6 +17,9 @@ from Orange.widgets.widget import OWWidget, Input, Output, Msg
 
 from orangecontrib.chem.molecule_embedder import MoleculeEmbedder
 from orangecontrib.chem.molecule_embedder import MODELS as EMBEDDERS_INFO
+from orangecontrib.chem.molecule_embedder_local import (
+    MissingOptionalDependencyError
+)
 
 
 class Result(SimpleNamespace):
@@ -74,7 +77,7 @@ def run_embedding(
         # recompute ticks to go from current state to 100
         ticks = iter(np.linspace(next(ticks), 100.0, file_paths_valid.size))
 
-        state.set_partial_result("squeezenet")
+        state.set_partial_result("smiles_cnn_local")
         embedder = MoleculeEmbedder(model="smiles_cnn_local")
         emb, skip, n_skip = embedder(
             data, col=smiles_column, callback=advance
@@ -111,6 +114,7 @@ class OWMoleculeEmbedding(OWWidget, ConcurrentWidgetMixin):
         molecules_skipped = Msg("{} molecules are skipped.")
 
     class Error(OWWidget.Error):
+        missing_library = Msg("{}")
         unexpected_error = Msg("Embedding error: {}")
 
     cb_smiles_attr_current_id: int = Setting(default=0)
@@ -263,7 +267,7 @@ class OWMoleculeEmbedding(OWWidget, ConcurrentWidgetMixin):
         self.start(
             run_embedding, self._input_data, smiles_attribute, embedder_name
         )
-        self.Error.unexpected_error.clear()
+        self.Error.clear()
 
     def on_done(self, result: Result) -> None:
         """
@@ -295,7 +299,10 @@ class OWMoleculeEmbedding(OWWidget, ConcurrentWidgetMixin):
         log = logging.getLogger(__name__)
         log.debug(ex, exc_info=ex)
         self.cancel_button.setDisabled(True)
-        self.Error.unexpected_error(type(ex).__name__, exc_info=ex)
+        if isinstance(ex, MissingOptionalDependencyError):
+            self.Error.missing_library(ex.msg)
+        else:
+            self.Error.unexpected_error(type(ex).__name__, exc_info=ex)
         self.clear_outputs()
         logging.debug("Exception", exc_info=ex)
 

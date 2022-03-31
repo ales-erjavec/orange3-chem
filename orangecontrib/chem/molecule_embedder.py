@@ -8,6 +8,8 @@ import numpy as np
 from Orange.data import ContinuousVariable, Domain, Table, StringVariable
 from Orange.misc.server_embedder import ServerEmbedderCommunicator
 
+from orangecontrib.chem.molecule_embedder_local import LocalEmbedder
+
 log = logging.getLogger(__name__)
 
 
@@ -20,6 +22,15 @@ MODELS = {
         'is_local': False,
         'layers': ['penultimate'],
         'order': 0
+    },
+    'smiles_cnn_local': {
+        'name': 'CNN-Based SMILES Embedder',
+        'description': 'CNN model trained on Pharmacologic Action MeSH terms classification',
+        'target_smiles_length': 1021,
+        'batch_size': 500,  # ??
+        'is_local': True,
+        'layers': ['penultimate'],
+        'order': 1
     },
 }
 

@@ -1,4 +1,4 @@
-recursive-include orangecontrib/chem *.svg *.png *.jpg
+recursive-include orangecontrib/chem *.svg *.png *.jpg *tflite
 
 include requirements.txt
 include README.md

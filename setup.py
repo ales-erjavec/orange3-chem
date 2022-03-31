@@ -44,6 +44,7 @@ PACKAGES = find_packages()
 
 PACKAGE_DATA = {
     'orangecontrib.chem.widgets': ['icons/*.svg'],
+    'orangecontrib.chem': ['data/*.tflite'],
 }
 
 INSTALL_REQUIRES = sorted(set(
