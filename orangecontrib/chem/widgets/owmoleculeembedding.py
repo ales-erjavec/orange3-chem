@@ -1,79 +1,141 @@
 import logging
-import os.path
-import traceback
-from types import SimpleNamespace as namespace
+from types import SimpleNamespace
+from typing import Optional
 
 import numpy as np
-from AnyQt.QtCore import Qt, QTimer, QThread, QThreadPool
-from AnyQt.QtCore import pyqtSlot as Slot
-from AnyQt.QtTest import QSignalSpy
-from AnyQt.QtWidgets import QLayout, QPushButton, QStyle
+from AnyQt.QtCore import Qt
+from AnyQt.QtWidgets import QPushButton, QStyle
 
-from Orange.data import Table, ContinuousVariable, Domain
+from Orange.data import Table, Variable
+from Orange.misc.utils.embedder_utils import EmbeddingConnectionError
 from Orange.widgets.gui import hBox
 from Orange.widgets.gui import widgetBox, widgetLabel, comboBox, auto_commit
 from Orange.widgets.settings import Setting
-from Orange.widgets.utils import concurrent as qconcurrent
+from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin, TaskState
 from Orange.widgets.utils.itemmodels import VariableListModel
-from Orange.widgets.widget import OWWidget, Default
+from Orange.widgets.widget import OWWidget, Input, Output, Msg
 
 from orangecontrib.chem.molecule_embedder import MoleculeEmbedder
 from orangecontrib.chem.molecule_embedder import MODELS as EMBEDDERS_INFO
 
 
-class _Input:
-    SMILES = 'Smiles'
+class Result(SimpleNamespace):
+    embedding: Optional[Table] = None
+    skip_smiles: Optional[Table] = None
+    num_skipped: int = None
 
 
-class _Output:
-    FINGERPRINTS = 'Fingerprints'
-    SKIPPED_SMILES = 'Skipped Smiles'
+def run_embedding(
+    data: Table,
+    smiles_column: Variable,
+    embedder_name: str,
+    state: TaskState,
+) -> Result:
+    """
+    Run the embedding process
+
+    Parameters
+    ----------
+    data
+        Data table with smiles to embed.
+    smiles_column
+        The column of the table with smiles.
+    embedder_name
+        The name of selected embedder.
+    state
+        State object used for controlling and progress.
+
+    Returns
+    -------
+    The object that holds embedded smiles, skipped smiles, and number
+    of skipped smiles.
+    """
+    embedder = MoleculeEmbedder(model=embedder_name)
+
+    file_paths = data[:, smiles_column].metas.flatten()
+
+    file_paths_mask = file_paths == smiles_column.Unknown
+    file_paths_valid = file_paths[~file_paths_mask]
+
+    # init progress bar and fuction
+    ticks = iter(np.linspace(0.0, 100.0, file_paths_valid.size))
+
+    def advance(success=True):
+        if state.is_interruption_requested():
+            embedder.set_canceled()
+        if success:
+            state.set_progress_value(next(ticks))
+
+    try:
+        emb, skip, n_skip = embedder(
+            data, col=smiles_column, callback=advance
+        )
+    except EmbeddingConnectionError:
+        # recompute ticks to go from current state to 100
+        ticks = iter(np.linspace(next(ticks), 100.0, file_paths_valid.size))
+
+        state.set_partial_result("squeezenet")
+        embedder = MoleculeEmbedder(model="smiles_cnn_local")
+        emb, skip, n_skip = embedder(
+            data, col=smiles_column, callback=advance
+        )
+
+    return Result(embedding=emb, skip_smiles=skip, num_skipped=n_skip)
 
 
-class OWMoleculeEmbedding(OWWidget):
+class OWMoleculeEmbedding(OWWidget, ConcurrentWidgetMixin):
     name = "Molecule Embedding"
     description = "Molecule embedding through deep neural networks."
+    keywords = ["embedding", "molecule embedding", "smiles"]
+
     icon = "../widgets/icons/category.svg"
     priority = 150
 
     want_main_area = False
-    _auto_apply = Setting(default=True)
+    resizing_enabled = False
 
-    inputs = [(_Input.SMILES, Table, 'set_data')]
-    outputs = [
-        (_Output.FINGERPRINTS, Table, Default),
-        (_Output.SKIPPED_SMILES, Table)
-    ]
+    class Inputs:
+        data = Input("Smiles", Table)
 
-    cb_smiles_attr_current_id = Setting(default=0)
-    cb_embedder_current_id = Setting(default=0)
+    class Outputs:
+        embeddings = Output("Fingerprints", Table, default=True)
+        skipped_smiles = Output("Skipped Smiles", Table)
+
+    class Warning(OWWidget.Warning):
+        switched_local_embedder = Msg(
+            "No internet connection: switched to local embedder"
+        )
+        no_smiles_attribute = Msg(
+            "Please provide data with an smiles attribute."
+        )
+        molecules_skipped = Msg("{} molecules are skipped.")
+
+    class Error(OWWidget.Error):
+        unexpected_error = Msg("Embedding error: {}")
+
+    cb_smiles_attr_current_id: int = Setting(default=0)
+    cb_embedder_current_id: int = Setting(default=0)
+
+    _auto_apply: bool = Setting(default=True)
 
     _NO_DATA_INFO_TEXT = "No data on input."
 
     def __init__(self):
-        super().__init__()
+        OWWidget.__init__(self)
+        ConcurrentWidgetMixin.__init__(self)
+
         self.embedders = sorted(list(EMBEDDERS_INFO),
                                 key=lambda k: EMBEDDERS_INFO[k]['order'])
         self._string_attributes = None
         self._input_data = None
         self._log = logging.getLogger(__name__)
         self._task = None
+        self._previous_attr_id = None
+        self._previous_embedder_id = None
+
         self._setup_layout()
-        self._smiles_embedder = None
-        self._executor = qconcurrent.ThreadExecutor(
-            self, threadPool=QThreadPool(maxThreadCount=1)
-        )
-        self.setBlocking(True)
-        QTimer.singleShot(0, self._init_server_connection)
 
     def _setup_layout(self):
-        self.controlArea.setMinimumWidth(self.controlArea.sizeHint().width())
-        self.layout().setSizeConstraint(QLayout.SetFixedSize)
-
-        widget_box = widgetBox(self.controlArea, 'Info')
-        self.input_data_info = widgetLabel(widget_box, self._NO_DATA_INFO_TEXT)
-        self.connection_info = widgetLabel(widget_box, "")
-
         widget_box = widgetBox(self.controlArea, 'Settings')
         self.cb_smiles_attr = comboBox(
             widget=widget_box,
@@ -92,8 +154,12 @@ class OWMoleculeEmbedding(OWWidget):
             orientation=Qt.Horizontal,
             callback=self._cb_embedder_changed
         )
-        self.cb_embedder.setModel(VariableListModel(
-            [EMBEDDERS_INFO[e]['name'] for e in self.embedders]))
+        names = [
+            EMBEDDERS_INFO[e]["name"]
+            + (" (local)" if EMBEDDERS_INFO[e].get("is_local") else "")
+            for e in self.embedders
+        ]
+        self.cb_embedder.setModel(VariableListModel(names))
         if not self.cb_embedder_current_id < len(self.embedders):
             self.cb_embedder_current_id = 0
         self.cb_embedder.setCurrentIndex(self.cb_embedder_current_id)
@@ -121,22 +187,25 @@ class OWMoleculeEmbedding(OWWidget):
         hbox.layout().addWidget(self.cancel_button)
         self.cancel_button.setDisabled(True)
 
-    def _init_server_connection(self):
-        self.setBlocking(False)
-        self._smiles_embedder = MoleculeEmbedder(
-            model=self.embedders[self.cb_embedder_current_id],
-            layer='penultimate'
-        )
-        self._set_server_info(
-            self._smiles_embedder.is_connected_to_server()
-        )
+    def set_output_data_summary(self, data_emb, data_skip):
+        if data_emb is None and data_skip is None:
+            self.info.set_output_summary(self.info.NoOutput)
+        else:
+            success = 0 if data_emb is None else len(data_emb)
+            skip = 0 if data_skip is None else len(data_skip)
+            self.info.set_output_summary(
+                f"{success}",
+                f"{success} molecules successfully embedded ,\n"
+                f"{skip} molecules skipped.",
+            )
 
+    @Inputs.data
     def set_data(self, data):
+        self.Warning.clear()
+
         if not data:
             self._input_data = None
-            self.send(_Output.FINGERPRINTS, None)
-            self.send(_Output.SKIPPED_SMILES, None)
-            self.input_data_info.setText(self._NO_DATA_INFO_TEXT)
+            self.clear_outputs()
             return
 
         self._string_attributes = MoleculeEmbedder.filter_string_attributes(data)
@@ -144,7 +213,6 @@ class OWMoleculeEmbedding(OWWidget):
             input_data_info_text = (
                 "Data with {:d} instances, but without string attributes."
                 .format(len(data)))
-            input_data_info_text.format(input_data_info_text)
             self.input_data_info.setText(input_data_info_text)
             self._input_data = None
             return
@@ -156,208 +224,98 @@ class OWMoleculeEmbedding(OWWidget):
         self.cb_smiles_attr.setCurrentIndex(self.cb_smiles_attr_current_id)
 
         self._input_data = data
-        self.input_data_info.setText(
-            "Data with {:d} instances.".format(len(data)))
+        self._previous_attr_id = self.cb_smiles_attr_current_id
+        self._previous_embedder_id = self.cb_embedder_current_id
 
-        self._cb_smiles_attr_changed()
+        self.unconditional_commit()
 
     def _cb_smiles_attr_changed(self):
-        self.commit()
+        self._cb_changed()
 
     def _cb_embedder_changed(self):
+        self.Warning.switched_local_embedder.clear()
         current_embedder = self.embedders[self.cb_embedder_current_id]
-        self._smiles_embedder = MoleculeEmbedder(
-            model=current_embedder,
-            layer='penultimate'
-        )
         self.embedder_info.setText(
-            EMBEDDERS_INFO[current_embedder]['description'])
-        if self._input_data:
-            self.input_data_info.setText(
-                "Data with {:d} instances.".format(len(self._input_data)))
+            EMBEDDERS_INFO[current_embedder]['description']
+        )
+        self._cb_changed()
+
+    def _cb_changed(self):
+        if (
+            self._previous_embedder_id != self.cb_embedder_current_id
+            or self._previous_attr_id != self.cb_smiles_attr_current_id
+        ):
+            # recompute embeddings only when selected value in dropdown changes
+            self._previous_embedder_id = self.cb_embedder_current_id
+            self._previous_attr_id = self.cb_smiles_attr_current_id
+            self.cancel()
             self.commit()
-        else:
-            self.input_data_info.setText(self._NO_DATA_INFO_TEXT)
 
     def commit(self):
-        if self._task is not None:
-            self.cancel()
-
-        if self._smiles_embedder is None:
-            self._set_server_info(connected=False)
-            return
-
         if not self._string_attributes or self._input_data is None:
-            self.send(_Output.FINGERPRINTS, None)
-            self.send(_Output.SKIPPED_SMILES, None)
+            self.clear_outputs()
             return
 
-        self._set_server_info(connected=True)
         self.cancel_button.setDisabled(False)
-        self.cb_smiles_attr.setDisabled(True)
-        self.cb_embedder.setDisabled(True)
 
-        smiles_attr = self._string_attributes[self.cb_smiles_attr_current_id]
-        smiles = self._input_data[:, smiles_attr].metas.flatten()
-
-        assert smiles_attr.is_string
-        assert smiles.dtype == np.dtype('O')
-
-        ticks = iter(np.linspace(0.0, 100.0, smiles.size))
-        set_progress = qconcurrent.methodinvoke(
-            self, "__progress_set", (float,))
-
-        def advance(success=True):
-            if success:
-                set_progress(next(ticks))
-
-        def cancel():
-            task.future.cancel()
-            task.cancelled = True
-            task.embedder.cancelled = True
-
-        embedder = self._smiles_embedder
-
-        def run_embedding(smiles_list):
-            return embedder(
-                smiles=smiles_list, smiles_processed_callback=advance)
-
-        self.auto_commit_widget.setDisabled(True)
-        self.progressBarInit(processEvents=None)
-        self.progressBarSet(0.0, processEvents=None)
-        self.setBlocking(True)
-
-        f = self._executor.submit(run_embedding, smiles)
-        f.add_done_callback(
-            qconcurrent.methodinvoke(self, "__set_results", (object,)))
-
-        task = self._task = namespace(
-            smiles=smiles,
-            embedder=embedder,
-            cancelled=False,
-            cancel=cancel,
-            future=f,
+        embedder_name = self.embedders[self.cb_embedder_current_id]
+        smiles_attribute = self._string_attributes[self.cb_smiles_attr_current_id]
+        self.start(
+            run_embedding, self._input_data, smiles_attribute, embedder_name
         )
-        self._log.debug("Starting embedding task for %i smiles",
-                        smiles.size)
-        return
+        self.Error.unexpected_error.clear()
 
-    @Slot(float)
-    def __progress_set(self, value):
-        assert self.thread() is QThread.currentThread()
-        if self._task is not None:
-            self.progressBarSet(value)
+    def on_done(self, result: Result) -> None:
+        """
+        Invoked when task is done.
 
-    @Slot(object)
-    def __set_results(self, f):
-        assert self.thread() is QThread.currentThread()
-        if self._task is None or self._task.future is not f:
-            self._log.info("Reaping stale task")
-            return
-
-        assert f.done()
-
-        task, self._task = self._task, None
-        self.auto_commit_widget.setDisabled(False)
+        Parameters
+        ----------
+        result
+            Embedding results.
+        """
         self.cancel_button.setDisabled(True)
-        self.cb_smiles_attr.setDisabled(False)
-        self.cb_embedder.setDisabled(False)
-        self.progressBarFinished(processEvents=None)
-        self.setBlocking(False)
+        assert len(self._input_data) == len(result.embedding or []) + len(
+            result.skip_smiles or []
+        )
+        self._send_output_signals(result)
 
-        try:
-            embeddings = f.result()
-        except ConnectionError:
-            self._log.exception("Error", exc_info=True)
-            self.send(_Output.FINGERPRINTS, None)
-            self.send(_Output.SKIPPED_SMILES, None)
-            self._set_server_info(connected=False)
-            return
-        except Exception as err:
-            self._log.exception("Error", exc_info=True)
-            self.error("\n".join(traceback.format_exception_only(type(err), err)))
-            self.send(_Output.FINGERPRINTS, None)
-            self.send(_Output.SKIPPED_SMILES, None)
-            return
+    def on_partial_result(self, result: str) -> None:
+        self._switch_to_local_embedder()
 
-        assert self._input_data is not None
-        assert len(self._input_data) == len(task.smiles)
+    def on_exception(self, ex: Exception) -> None:
+        """
+        When an exception occurs during the calculation.
 
-        embeddings_all = [None] * len(task.smiles)
-        for i, embedding in enumerate(embeddings):
-            embeddings_all[i] = embedding
-        embeddings_all = np.array(embeddings_all)
-        self._send_output_signals(embeddings_all)
+        Parameters
+        ----------
+        ex
+            Exception occurred during the embedding.
+        """
+        log = logging.getLogger(__name__)
+        log.debug(ex, exc_info=ex)
+        self.cancel_button.setDisabled(True)
+        self.Error.unexpected_error(type(ex).__name__, exc_info=ex)
+        self.clear_outputs()
+        logging.debug("Exception", exc_info=ex)
 
-    def _send_output_signals(self, embeddings):
-        embedded_smiles, skipped_smiles, num_skipped =\
-            MoleculeEmbedder.prepare_output_data(self._input_data, embeddings)
-        self.send(_Output.SKIPPED_SMILES, skipped_smiles)
-        self.send(_Output.FINGERPRINTS, embedded_smiles)
-        if num_skipped is not 0:
-            self.input_data_info.setText(
-                "Data with {:d} instances, {:d} SMILES skipped.".format(
-                    len(self._input_data), num_skipped))
+    def _switch_to_local_embedder(self):
+        self.Warning.switched_local_embedder()
+        self.cb_embedder_current_id = self.embedders.index("smiles_cnn_local")
 
-    def _set_server_info(self, connected):
-        self.clear_messages()
-        if connected:
-            self.connection_info.setText("Connected to server.")
-        else:
-            self.connection_info.setText("No connection with server.")
-            self.warning("Click Apply to try again.")
+    def _send_output_signals(self, result: Result) -> None:
+        self.Warning.molecules_skipped.clear()
+        self.Outputs.embeddings.send(result.embedding)
+        self.Outputs.skipped_smiles.send(result.skip_smiles)
+        if result.num_skipped != 0:
+            self.Warning.molecules_skipped(result.num_skipped)
+        self.set_output_data_summary(result.embedding, result.skip_smiles)
+
+    def clear_outputs(self):
+        self._send_output_signals(
+            Result(embedding=None, skip_smiles=None, num_skipped=0)
+        )
 
     def onDeleteWidget(self):
         self.cancel()
         super().onDeleteWidget()
-        if self._smiles_embedder is not None:
-            self._smiles_embedder.__exit__(None, None, None)
-
-    def cancel(self):
-        if self._task is not None:
-            task, self._task = self._task, None
-            task.cancel()
-            # wait until done
-            try:
-                task.future.exception()
-            except qconcurrent.CancelledError:
-                pass
-
-            self.auto_commit_widget.setDisabled(False)
-            self.cancel_button.setDisabled(True)
-            self.progressBarFinished(processEvents=None)
-            self.setBlocking(False)
-            self.cb_smiles_attr.setDisabled(False)
-            self.cb_embedder.setDisabled(False)
-            self._smiles_embedder.cancelled = False
-            # reset the connection.
-            connected = self._smiles_embedder.reconnect_to_server()
-            self._set_server_info(connected=connected)
-
-
-def main(argv=None):
-    from AnyQt.QtWidgets import QApplication
-    logging.basicConfig(level=logging.DEBUG)
-    app = QApplication(list(argv) if argv else [])
-    argv = app.arguments()
-    if len(argv) > 1:
-        filename = argv[1]
-    else:
-        filename = "zoo-with-images"
-    data = Table(filename)
-    widget = OWMoleculeEmbedding()
-    widget.show()
-    assert QSignalSpy(widget.blockingStateChanged).wait()
-    widget.set_data(data)
-    widget.handleNewSignals()
-    app.exec()
-    widget.set_data(None)
-    widget.handleNewSignals()
-    widget.saveSettings()
-    widget.onDeleteWidget()
-    return 0
-
-
-if __name__ == '__main__':
-    import sys
-    sys.exit(main(sys.argv))
