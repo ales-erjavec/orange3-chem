@@ -1,14 +1,17 @@
 import abc
+import os
 from typing import Any
 
-from AnyQt.QtCore import QTimer, Slot, Qt
+from AnyQt.QtCore import QTimer, Slot, Qt, QSettings
 from AnyQt.QtWidgets import QComboBox
 
-from orangewidget import gui
+from orangewidget import gui, settings
+from orangewidget.utils.combobox import ComboBox
 
 from Orange.widgets.widget import OWWidget, Input, Output, Msg
 from Orange.widgets.settings import Setting
 from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin
+from Orange.widgets.utils import qname
 
 Input = Input
 Output = Output
@@ -77,6 +80,25 @@ class OWConcurrentWidget(OWWidget, ConcurrentWidgetMixin, openclass=True):
         self.__do_commit()
 
 
+class TextEditComboBox(ComboBox):
+    def text(self) -> str:
+        """
+        Return the current text.
+        """
+        return self.itemText(self.currentIndex())
+
+    def setText(self, text: str) -> None:
+        """
+        Set `text` as the current text (adding it to the model if necessary).
+        """
+        idx = self.findData(text, Qt.EditRole, Qt.MatchExactly)
+        if idx != -1:
+            self.setCurrentIndex(idx)
+        else:
+            self.addItem(text)
+            self.setCurrentIndex(self.count() - 1)
+
+
 def cbselect(
         cb: QComboBox, value, role: Qt.ItemDataRole = Qt.EditRole, default=-1
 ) -> None:
@@ -96,3 +118,10 @@ def cbselect(
     if idx == -1:
         idx = default
     cb.setCurrentIndex(idx)
+
+
+def local_settings(cls: type) -> QSettings:
+    """Return a `QSettings` instance with local persistent settings."""
+    filename = "{}.ini".format(qname(cls))
+    fname = os.path.join(settings.widget_settings_dir(), filename)
+    return QSettings(fname, QSettings.IniFormat)
