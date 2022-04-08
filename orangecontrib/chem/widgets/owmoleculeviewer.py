@@ -4,19 +4,22 @@ Molecule Image Viewer Widget
 
 """
 from collections import namedtuple
-from concurrent.futures import Future
-from typing import List, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import List, Sequence, Optional
 
 from rdkit import Chem
 from rdkit.Chem import Draw
 
-from AnyQt.QtGui import QPixmap, QImage, QKeyEvent
-from AnyQt.QtWidgets import QApplication, QStyleOptionViewItem
-
+from AnyQt.QtGui import QKeyEvent, QPainter, QIcon
+from AnyQt.QtWidgets import QApplication, QStyleOptionViewItem, QStyle
+from AnyQt.QtSvg import QSvgRenderer
 from AnyQt.QtCore import (
-    Qt, QSize, QModelIndex, QObject, QEvent, Signal, Slot
+    Qt, QSize, QModelIndex, QObject, QEvent, Signal, Slot,
+    QPersistentModelIndex
 )
-
+from orangecanvas.gui.svgiconengine import SvgIconEngine
+from orangewidget.utils.cache import LRUCache
+from orangewidget.utils.concurrent import FutureWatcher
 from orangewidget.utils.itemmodels import PyListModel
 
 import Orange.data
@@ -36,15 +39,20 @@ _ImageItem = namedtuple(
 ])
 
 
-def pixmap_from_smiles(s: str) -> QPixmap:
+def svg_from_smiles(s: str, size=(400, 400)) -> bytes:
     p = Chem.MolFromSmiles(s)
     if p:
-        return Draw.MolToQPixmap(p)
+        draw = Draw.rdMolDraw2D.MolDraw2DSVG(*size)
+        draw.DrawMolecule(p)
+        draw.FinishDrawing()
+        svg = draw.GetDrawingText()
+        return svg.encode("utf-8")
     else:
-        return QPixmap()
+        return b''
 
 
 SmilesDataRole = Qt.UserRole + 100
+SvgDataRole = SmilesDataRole + 1
 
 
 class MoleculesView(thumbnailview.IconView):
@@ -65,19 +73,32 @@ class MoleculesView(thumbnailview.IconView):
 
 
 class MoleculeViewDelegate(thumbnailview.IconViewDelegate):
-    def renderThumbnail(self, index: QModelIndex) -> 'Future[QImage]':
+    def __init__(self, *args, **kwargs):
+        super(MoleculeViewDelegate, self).__init__(*args, **kwargs)
+        self._svg_renderer_cache = LRUCache(maxlen=1000)
+        self._exc = ThreadPoolExecutor()
+
+    def renderThumbnail(self, index: QModelIndex) -> 'Future':
         smiles = index.data(SmilesDataRole)
-        if isinstance(smiles, str):
-            m = pixmap_from_smiles(smiles)
-        else:
-            m = QPixmap()
-        f = Future()
-        f.set_running_or_notify_cancel()
-        f.set_result(m.toImage())
+        pindex = QPersistentModelIndex(index)
+
+        def f():
+            svg = None
+            if isinstance(smiles, str):
+                svg = svg_from_smiles(smiles)
+            return pindex, svg
+        f = self._exc.submit(f)
+        w = FutureWatcher(f, done=self.__on_svg_finished)
+        f.watcher = w
         return f
 
-    def initStyleOption(self, option: 'QStyleOptionViewItem', index: QModelIndex) -> None:
-        super().initStyleOption(option, index)
+    @Slot(Future)
+    def __on_svg_finished(self, f):
+        pindex, content = f.result()
+        if pindex.isValid():
+            index = QModelIndex(pindex)
+            model = index.model()
+            model.setData(index, content, SvgDataRole)
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
         sh = super().sizeHint(option, index)
@@ -86,9 +107,27 @@ class MoleculeViewDelegate(thumbnailview.IconViewDelegate):
         sh.setWidth(min(sh.width(), int(maxw + 8)))
         return sh
 
+    def paint(self, painter, option, index) -> None:
+        self.startThumbnailRender(index)
+        widget = option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        svg = index.data(SvgDataRole)
+
+        if svg is not None:
+            eng = self._svg_renderer_cache.get(svg)
+            if eng is None:
+                eng = SvgIconEngine(svg)
+            opt.icon = QIcon(eng)
+            opt.features |= QStyleOptionViewItem.HasDecoration
+        style.drawControl(QStyle.CE_ItemViewItem, opt, painter, widget)
+
 
 class MolPreview(imagepreview.Preview):
     widget: MoleculesView = None
+    _svg = None
+    _renderer = None
 
     def setIconView(self, view: thumbnailview.IconView):
         if self.widget is not None:
@@ -138,11 +177,26 @@ class MolPreview(imagepreview.Preview):
         index = self.widget.currentIndex()
         delegate = self.widget.itemDelegate()
         assert isinstance(delegate, MoleculeViewDelegate)
-        img = delegate.thumbnailImage(index)
-        if img is not None:
-            self.setPixmap(QPixmap.fromImage(img))
+        svg = index.data(SvgDataRole)
+        if svg is not None:
+            self.setSvgContent(svg)
         else:
-            self.setPixmap(QPixmap())
+            self.setSvgContent(b'')
+
+    def setSvgContent(self, svg):
+        self._svg = svg
+        self._renderer = QSvgRenderer(svg)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        self._renderer.render(painter)
+
+    def sizeHint(self):
+        if self._renderer:
+            return self._renderer.defaultSize()
+        else:
+            return super().sizeHint()
 
 
 class OWMoleculeViewer(widget.OWWidget):
