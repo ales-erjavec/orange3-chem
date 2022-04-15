@@ -3,15 +3,16 @@ Molecule Image Viewer Widget
 -------------------
 
 """
-from collections import namedtuple
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import List, Sequence, Optional
+from typing import Sequence, Any, Iterable
 
 from rdkit import Chem
 from rdkit.Chem import Draw
 
 from AnyQt.QtGui import QKeyEvent, QPainter, QIcon
-from AnyQt.QtWidgets import QApplication, QStyleOptionViewItem, QStyle
+from AnyQt.QtWidgets import (
+    QApplication, QStyleOptionViewItem, QStyle, QAbstractItemView
+)
 from AnyQt.QtSvg import QSvgRenderer
 from AnyQt.QtCore import (
     Qt, QSize, QModelIndex, QObject, QEvent, Signal, Slot,
@@ -20,23 +21,16 @@ from AnyQt.QtCore import (
 from orangecanvas.gui.svgiconengine import SvgIconEngine
 from orangewidget.utils.cache import LRUCache
 from orangewidget.utils.concurrent import FutureWatcher
-from orangewidget.utils.itemmodels import PyListModel
 
 import Orange.data
 from Orange.widgets import widget, gui, settings
 from Orange.widgets.utils.itemmodels import VariableListModel
 from Orange.widgets.widget import Input, Output
 
+from orangecontrib.chem.widgets.utils.itemmodels import ListModelAdapter
 from orangecontrib.imageanalytics.widgets.utils import (
     thumbnailview, imagepreview
 )
-
-
-_ImageItem = namedtuple(
-    "_ImageItem",
-    ["index",   # Row index in the input data table
-     "smiles",  # Molecule SMILES
-])
 
 
 def svg_from_smiles(s: str, size=(400, 400)) -> bytes:
@@ -71,6 +65,19 @@ class MoleculesView(thumbnailview.IconView):
         self.currentIndexChanged.emit(current)
         super().currentChanged(current, previous)
 
+    def dataChanged(
+            self, topLeft: QModelIndex, bottomRight: QModelIndex,
+            roles: Iterable[int] = ()
+    ) -> None:
+        if bottomRight.row() - topLeft.row() > 10000:
+            if self.model().rowCount() > 10000:
+                # QListView::dataChanged relays the whole changed range in
+                # single pass ignoring layoutMode == Batched.
+                QAbstractItemView.dataChanged(self, topLeft, bottomRight, roles)
+        else:
+            super().dataChanged(topLeft, bottomRight, roles)
+        self.preview.updatePreview()
+
 
 class MoleculeViewDelegate(thumbnailview.IconViewDelegate):
     def __init__(self, *args, **kwargs):
@@ -98,7 +105,8 @@ class MoleculeViewDelegate(thumbnailview.IconViewDelegate):
         if pindex.isValid():
             index = QModelIndex(pindex)
             model = index.model()
-            model.setData(index, content, SvgDataRole)
+            res = model.setData(index, content, SvgDataRole)
+            assert res
 
     def sizeHint(self, option: QStyleOptionViewItem, index: QModelIndex) -> QSize:
         sh = super().sizeHint(option, index)
@@ -234,10 +242,7 @@ class OWMoleculeViewer(widget.OWWidget):
         self.data = None
         self.allAttrs = []
         self.stringAttrs = []
-
         self.selectedIndices = []
-
-        self.items: List[_ImageItem] = []
 
         self.smilesAttrCB = gui.comboBox(
             self.controlArea, self, "smilesAttr",
@@ -336,39 +341,33 @@ class OWMoleculeViewer(widget.OWWidget):
         if self.data is not None:
             attr = self.stringAttrs[self.smilesAttr]
             titleAttr = self.allAttrs[self.titleAttr]
-            smiles = column_data_as_str(self.data, attr)
+            smiles = column_data(self.data, attr)
             titles = column_data_as_str(self.data, titleAttr)
             assert self.thumbnailView.count() == 0
             assert len(self.data) == len(smiles)
-
-            items = [{}] * len(smiles)
-            for i, (smiles, title) in enumerate(zip(smiles, titles)):
-                if not smiles:  # skip missing
-                    continue
-                items[i] = {
-                    Qt.DisplayRole: title,
-                    Qt.EditRole: title,
-                    Qt.DecorationRole: smiles,
-                    Qt.ToolTipRole: smiles,
-                    SmilesDataRole: smiles,
+            svgs = [None] * len(smiles)
+            model = ListModelAdapter(
+                len(smiles), {
+                    Qt.DisplayRole: titles.__getitem__,
+                    Qt.EditRole: titles.__getitem__,
+                    Qt.DecorationRole: smiles.__getitem__,
+                    Qt.ToolTipRole: smiles.__getitem__,
+                    SmilesDataRole: smiles.__getitem__,
+                    SvgDataRole: svgs.__getitem__
                 }
-                self.items.append(_ImageItem(i, smiles))
-
-            model = PyListModel([""] * len(items))
-            for i, data in enumerate(items):
-                model.setItemData(model.index(i), data)
+            )
+            model.setSetterDelegateForRole(SvgDataRole, svgs.__setitem__)
             self.thumbnailView.setModel(model)
             self.thumbnailView.selectionModel().selectionChanged.connect(
                 self.onSelectionChanged
             )
 
     def clearModel(self):
-        self.items = []
         model = self.thumbnailView.model()
         if model is not None:
             selmodel = self.thumbnailView.selectionModel()
             selmodel.selectionChanged.disconnect(self.onSelectionChanged)
-            model.clear()
+            model.deleteLater()
         self.thumbnailView.setModel(None)
         self.delegate.deleteLater()
         self.delegate = MoleculeViewDelegate()
@@ -380,16 +379,14 @@ class OWMoleculeViewer(widget.OWWidget):
     def updateTitles(self):
         titleAttr = self.allAttrs[self.titleAttr]
         titles = column_data_as_str(self.data, titleAttr)
-        model = self.thumbnailView.model()
-        for i, item in enumerate(self.items):
-            model.setData(model.index(i, 0), titles[item.index], Qt.EditRole)
+        model: ListModelAdapter = self.thumbnailView.model()
+        model.setDelegateForRole(Qt.DisplayRole, titles.__getitem__)
 
     @Slot()
     def onSelectionChanged(self):
-        items = self.items
         smodel = self.thumbnailView.selectionModel()
         indices = [idx.row() for idx in smodel.selectedRows()]
-        self.selectedIndices = [items[i].index for i in indices]
+        self.selectedIndices = indices
         self.commit()
 
     def commit(self):
@@ -413,3 +410,10 @@ def column_data_as_str(
     var = table.domain[var]
     data, _ = table.get_column_view(var)
     return list(map(var.str_val, data))
+
+
+def column_data(
+        table: Orange.data.Table, var: Orange.data.Variable
+) -> Sequence[Any]:
+    data, _ = table.get_column_view(var)
+    return data.tolist()
