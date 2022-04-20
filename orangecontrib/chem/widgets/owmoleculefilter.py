@@ -37,6 +37,7 @@ class OWMoleculeFilter(OWConcurrentWidget):
 
     class Inputs:
         data = Input("Data", Table)
+        smarts = Input("SMARTS", str)
 
     class Outputs:
         selected_data = Output("Selected Data", Table)
@@ -163,6 +164,26 @@ class OWMoleculeFilter(OWConcurrentWidget):
     def set_data(self, data):
         self.data = data
         self.invalidate()
+
+    @Inputs.smarts
+    def set_smarts(self, smarts):
+        if smarts != self.current_filter:
+            if smarts:
+                self.filter_cb.setText(smarts)
+            self.invalidate()
+
+    def customEvent(self, event: 'QEvent') -> None:
+        from orangecanvas.scheme import LinkEvent
+        if event.type() == LinkEvent.InputLinkAdded:
+            assert isinstance(event, LinkEvent)
+            print(event.link().sink_channel.name)
+            if event.link().sink_channel.name == "SMARTS":
+                print("We GOT IT")
+        elif event.type() == LinkEvent.InputLinkRemoved:
+            assert isinstance(event, LinkEvent)
+            if event.link().sink_channel.name == "SMARTS":
+                print("We LOST IT")
+        super().customEvent(event)
 
     def handleNewSignals(self):
         if self.data is not None:
