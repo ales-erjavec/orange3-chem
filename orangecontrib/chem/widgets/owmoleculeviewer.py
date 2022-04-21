@@ -3,8 +3,10 @@ Molecule Image Viewer Widget
 -------------------
 
 """
+from itertools import chain
+
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Sequence, Any, Iterable
+from typing import Sequence, Any, Iterable, Optional
 
 from rdkit import Chem
 from rdkit.Chem import Draw
@@ -45,6 +47,37 @@ def svg_from_smiles(s: str, size=(400, 400)) -> bytes:
         return b''
 
 
+def svg_from_smiles_with_substructure(s, substr, size=(400, 400)):
+    p = Chem.MolFromSmiles(s)
+    if p:
+        return svg_from_mol_with_substructure(p, substr, size)
+    else:
+        return b''
+
+
+def svg_from_mol_with_substructure(
+        mol: Chem.Mol, substruct: Chem.Mol, size=(400, 400)
+) -> bytes:
+    atom_matches = list(mol.GetSubstructMatches(substruct))
+    bonds = substruct.GetBonds()
+    bond_matches = []
+    if atom_matches:
+        for bond in bonds:
+            for match in atom_matches:
+                idx1 = match[bond.GetBeginAtomIdx()]
+                idx2 = match[bond.GetEndAtomIdx()]
+                bond_matches.append(mol.GetBondBetweenAtoms(idx1, idx2).GetIdx())
+    atom_matches = list(set(chain.from_iterable(atom_matches)))
+    bond_matches = list(set(bond_matches))
+    draw = Draw.rdMolDraw2D.MolDraw2DSVG(*size)
+    Draw.rdMolDraw2D.PrepareAndDrawMolecule(
+        draw, mol, highlightAtoms=atom_matches, highlightBonds=bond_matches
+    )
+    draw.FinishDrawing()
+    svg = draw.GetDrawingText()
+    return svg.encode("utf-8")
+
+
 SmilesDataRole = Qt.UserRole + 100
 SvgDataRole = SmilesDataRole + 1
 
@@ -80,19 +113,31 @@ class MoleculesView(thumbnailview.IconView):
 
 
 class MoleculeViewDelegate(thumbnailview.IconViewDelegate):
-    def __init__(self, *args, **kwargs):
-        super(MoleculeViewDelegate, self).__init__(*args, **kwargs)
+    def __init__(
+            self, *args, highlightSubstructure: Optional[Chem.Mol] = None,
+            **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self._highlight = highlightSubstructure
         self._svg_renderer_cache = LRUCache(maxlen=1000)
         self._exc = ThreadPoolExecutor()
+
+    def setHighlightSubstructure(self, substruct: Optional[Chem.Mol]):
+        self._highlight = substruct
+        self._svg_renderer_cache.clear()
+        self.displayChanged.emit()
 
     def renderThumbnail(self, index: QModelIndex) -> 'Future':
         smiles = index.data(SmilesDataRole)
         pindex = QPersistentModelIndex(index)
-
+        sub = self._highlight
         def f():
             svg = None
             if isinstance(smiles, str):
-                svg = svg_from_smiles(smiles)
+                if sub is None:
+                    svg = svg_from_smiles(smiles)
+                else:
+                    svg = svg_from_smiles_with_substructure(smiles, sub)
             return pindex, svg
         f = self._exc.submit(f)
         w = FutureWatcher(f, done=self.__on_svg_finished)
@@ -215,6 +260,7 @@ class OWMoleculeViewer(widget.OWWidget):
 
     class Inputs:
         data = Input("Data", Orange.data.Table)
+        smarts = Input("SMARTS", str)
 
     class Outputs:
         data = Output("Data", Orange.data.Table)
@@ -240,6 +286,8 @@ class OWMoleculeViewer(widget.OWWidget):
     def __init__(self):
         super().__init__()
         self.data = None
+        self.smarts: Optional[Chem.Mol] = None
+
         self.allAttrs = []
         self.stringAttrs = []
         self.selectedIndices = []
@@ -329,6 +377,22 @@ class OWMoleculeViewer(widget.OWWidget):
             if self.stringAttrs:
                 self.setupModel()
 
+    @Inputs.smarts
+    def setSmarts(self, smarts: str):
+        pattern = None
+        if smarts is not None:
+            pattern = Chem.MolFromSmarts(smarts)
+            if pattern is None:
+                self.error("Invalid SMARTS")
+        self.smarts = pattern
+        delegate: MoleculeViewDelegate = self.thumbnailView.itemDelegate()
+        if delegate:
+            delegate.deleteLater()
+        self.delegate = MoleculeViewDelegate(
+            highlightSubstructure=self.smarts
+        )
+        self.thumbnailView.setItemDelegate(self.delegate)
+
     def clear(self):
         self.data = None
         self.error()
@@ -370,7 +434,9 @@ class OWMoleculeViewer(widget.OWWidget):
             model.deleteLater()
         self.thumbnailView.setModel(None)
         self.delegate.deleteLater()
-        self.delegate = MoleculeViewDelegate()
+        self.delegate = MoleculeViewDelegate(
+            highlightSubstructure=self.smarts
+        )
         self.thumbnailView.setItemDelegate(self.delegate)
 
     def updateSize(self):
