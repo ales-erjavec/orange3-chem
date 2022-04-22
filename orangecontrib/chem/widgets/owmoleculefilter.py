@@ -1,12 +1,11 @@
 from functools import partial
-from typing import Optional, TypedDict
+from typing import Optional
 from concurrent.futures import CancelledError
 
 import numpy as np
 from rdkit import Chem
 
 from AnyQt.QtCore import Qt
-from AnyQt.QtWidgets import QFormLayout
 
 from orangecanvas.utils.settings import (
     QSettings_readArray, QSettings_writeArray
@@ -16,21 +15,20 @@ from orangewidget.settings import Setting
 from orangewidget.utils.combobox import ComboBoxSearch
 from orangewidget.utils.itemmodels import PyListModel
 
-from Orange.data import Table, StringVariable
-from Orange.widgets.utils.itemmodels import DomainModel
+from Orange.data import Table
 from Orange.widgets.utils.concurrent import TaskState
 from Orange.widgets.utils.annotated_data import (
     create_annotated_table, ANNOTATED_DATA_SIGNAL_NAME
 )
-
 from orangecontrib.chem.widgets.common import (
     OWConcurrentWidget, Input, Output, Msg, TextEditComboBox, local_settings,
+    SmilesFormWidget, cb_find_smiles_column,
 )
 
 MAX_HISTORY = 30
 
 
-class OWMoleculeFilter(OWConcurrentWidget):
+class OWMoleculeFilter(SmilesFormWidget):
     name = "Molecule Filter"
     description = "Filter molecules based on SMARTS patterns"
     icon = "icons/category.svg"
@@ -46,28 +44,18 @@ class OWMoleculeFilter(OWConcurrentWidget):
     class Error(OWConcurrentWidget.Error):
         smarts = Msg("Invalid SMARTS pattern")
 
-    want_main_area = False
-    resizing_enabled = False
-
-    class State(TypedDict):
-        smiles_column: str
+    class State(SmilesFormWidget.State):
         filter_pattern: str
 
     settings: State = Setting({
-        "smiles_column": "SMILES",
+        **SmilesFormWidget.settings.default,
         "filter_pattern": "C(=O)[O;H,-]"
     })
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.data: Optional[Table] = None
-        self.smiles_var = None
-        self.smiles_model = DomainModel(valid_types=(StringVariable,))
         self.filter_model = PyListModel()
-        self.smiles_cb = ComboBoxSearch(
-            minimumContentsLength=20,
-            sizeAdjustPolicy=ComboBoxSearch.AdjustToMinimumContentsLengthWithIcon,
-        )
         self.filter_cb = TextEditComboBox(
             minimumContentsLength=40,
             sizeAdjustPolicy=ComboBoxSearch.AdjustToMinimumContentsLengthWithIcon,
@@ -75,18 +63,9 @@ class OWMoleculeFilter(OWConcurrentWidget):
             editable=True,
         )
         self.filter_cb.lineEdit().setPlaceholderText("SMARTS pattern...")
-        form = QFormLayout(
-            formAlignment=Qt.AlignLeft,
-            labelAlignment=Qt.AlignLeft,
-            fieldGrowthPolicy=QFormLayout.AllNonFixedFieldsGrow,
-        )
-        form.addRow("SMILES", self.smiles_cb)
-        form.addRow("Filter", self.filter_cb)
+        self.form.addRow("Filter", self.filter_cb)
 
-        self.controlArea.layout().addLayout(form)
-        self.smiles_cb.setModel(self.smiles_model)
         self.filter_cb.setModel(self.filter_model)
-        self.smiles_cb.activated.connect(self.__set_smiles_index)
         self.filter_cb.activated.connect(self.__filter_changed)
         self.restore()
         # TODO: Pre-populate filter_model with
@@ -119,19 +98,6 @@ class OWMoleculeFilter(OWConcurrentWidget):
             model.setData(model.index(model.rowCount() -1), item["key"], Qt.UserRole)
         self.filter_cb.setCurrentIndex(0)
 
-    def __set_smiles_index(self, index: int):
-        self.smiles_cb.setCurrentIndex(index)
-        if index < 0:
-            smiles_var = None
-        else:
-            smiles_var = self.smiles_model[index]
-
-        if self.smiles_var != smiles_var:
-            self.smiles_var = smiles_var
-            if smiles_var is not None:
-                self.settings["smiles_column"] = smiles_var.name
-            self.invalidate()
-
     def __filter_changed(self):
         smarts = self.filter_cb.currentText()
         if smarts and Chem.MolFromSmarts(smarts):
@@ -153,13 +119,6 @@ class OWMoleculeFilter(OWConcurrentWidget):
     def current_filter(self) -> str:
         return self.filter_cb.currentData(Qt.EditRole)
 
-    @property
-    def current_smiles(self):
-        idx = self.smiles_cb.currentIndex()
-        if idx >= 0:
-            return self.smiles_model[idx]
-        return None
-
     @Inputs.data
     def set_data(self, data):
         self.data = data
@@ -175,23 +134,24 @@ class OWMoleculeFilter(OWConcurrentWidget):
     def handleNewSignals(self):
         if self.data is not None:
             self.smiles_model.set_domain(self.data.domain)
-            idx = self.smiles_cb.findText(self.settings["smiles_column"])
-            self.__set_smiles_index(idx)
+            idx = cb_find_smiles_column(
+                self.smiles_cb, self.settings["smiles_column"]
+            )
+            self.set_smiles_column(idx)
         else:
             self.smiles_model.set_domain(None)
-
         super().handleNewSignals()
 
     def commit(self):
         self.Error.smarts.clear()
-        if self.data is None or self.current_smiles is None:
+        if self.data is None or self.smiles_column() is None:
             self.clear_outputs()
         else:
             self.start(self.create_task())
 
     def create_task(self):
         data = self.data
-        column = self.current_smiles
+        column = self.smiles_column()
         pattern = self.current_filter
         return partial(run, data, column, pattern)
 

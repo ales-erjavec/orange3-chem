@@ -1,13 +1,15 @@
 import abc
 import os
-from typing import Any
+from typing import Any, Optional, TypedDict, Union
 
 from AnyQt.QtCore import QTimer, Slot, Qt, QSettings
-from AnyQt.QtWidgets import QComboBox
+from AnyQt.QtWidgets import QComboBox, QFormLayout
 
 from orangewidget import gui, settings
-from orangewidget.utils.combobox import ComboBox
+from orangewidget.utils.combobox import ComboBox, ComboBoxSearch
 
+from Orange.data import StringVariable
+from Orange.widgets.utils.itemmodels import DomainModel
 from Orange.widgets.widget import OWWidget, Input, Output, Msg
 from Orange.widgets.settings import Setting
 from Orange.widgets.utils.concurrent import ConcurrentWidgetMixin
@@ -80,6 +82,71 @@ class OWConcurrentWidget(OWWidget, ConcurrentWidgetMixin, openclass=True):
         self.__do_commit()
 
 
+class SimpleFormWidget(OWConcurrentWidget, openclass=True):
+    want_main_area = False
+    resizing_enabled = False
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.form = QFormLayout(
+            objectName="main-form",
+            formAlignment=Qt.AlignLeft,
+            labelAlignment=Qt.AlignLeft,
+            fieldGrowthPolicy=QFormLayout.AllNonFixedFieldsGrow,
+        )
+        self.controlArea.layout().addLayout(self.form)
+
+
+class SmilesFormWidget(SimpleFormWidget, openclass=True):
+    smiles_var: Optional[StringVariable] = None
+
+    class State(TypedDict):
+        smiles_column: Optional[str]
+
+    settings: State = Setting({
+        "smiles_column": None,
+    })
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.settings = {
+            **type(self).settings.default,
+            **self.settings,
+        }
+        self.smiles_model = DomainModel()
+        self.smiles_cb = ComboBoxSearch(
+            objectName="smiles-cb",
+            minimumContentsLength=20,
+            sizeAdjustPolicy=ComboBoxSearch.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.smiles_cb.setModel(self.smiles_model)
+        self.smiles_cb.activated.connect(self.__set_smiles_index)
+        self.form.addRow("Smiles", self.smiles_cb)
+
+    def __set_smiles_index(self, index: int):
+        self.smiles_cb.setCurrentIndex(index)
+        if index < 0:
+            smiles_var = None
+        else:
+            smiles_var = self.smiles_model[index]
+
+        if self.smiles_var != smiles_var:
+            self.smiles_var = smiles_var
+            if smiles_var is not None:
+                self.settings["smiles_column"] = smiles_var.name
+            self.invalidate()
+
+    def set_smiles_column(self, column: Union[StringVariable, int]):
+        if isinstance(column, StringVariable):
+            index = self.smiles_model.indexOf(column)
+        else:
+            index = column
+        self.__set_smiles_index(index)
+
+    def smiles_column(self) -> StringVariable:
+        return self.smiles_var
+
+
 class TextEditComboBox(ComboBox):
     def text(self) -> str:
         """
@@ -118,6 +185,13 @@ def cbselect(
     if idx == -1:
         idx = default
     cb.setCurrentIndex(idx)
+
+
+def cb_find_smiles_column(cb: QComboBox, name=None, role=Qt.DisplayRole):
+    if name is not None:
+        return cb.findData(name, role)
+    else:
+        return cb.findData("smiles", role, Qt.MatchFixedString)
 
 
 def local_settings(cls: type) -> QSettings:

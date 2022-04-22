@@ -10,18 +10,18 @@ from rdkit.DataStructs import ExplicitBitVect
 import numpy as np
 
 from AnyQt.QtCore import Qt
-from AnyQt.QtWidgets import QFormLayout
 
 from orangewidget.utils.itemmodels import PyListModel
 from orangewidget.utils.combobox import ComboBoxSearch, ComboBox
 
 from Orange.data import Table, StringVariable, DiscreteVariable, Domain
 from Orange.widgets.utils.concurrent import TaskState
-from Orange.widgets.utils.itemmodels import DomainModel
 from Orange.widgets.widget import Input, Output
 from Orange.widgets.settings import Setting
 
-from orangecontrib.chem.widgets.common import OWConcurrentWidget, cbselect
+from orangecontrib.chem.widgets.common import (
+    SmilesFormWidget, cbselect, cb_find_smiles_column
+)
 
 
 @dataclass
@@ -109,7 +109,7 @@ Fingerprints = [
 ]
 
 
-class OWMoleculeFingerprints(OWConcurrentWidget):
+class OWMoleculeFingerprints(SmilesFormWidget):
     name = "Molecule Fingerprints"
     description = "Compute molecule fingerprints"
     icon = "../widgets/icons/category.svg"
@@ -120,21 +120,19 @@ class OWMoleculeFingerprints(OWConcurrentWidget):
     class Outputs:
         data = Output("Data", Table)
 
-    want_main_area = False
-    resizing_enabled = False
+    class State(SmilesFormWidget.State):
+        finger_print_method: str
 
-    smiles_var_name = Setting("SMILES")
-    finger_print_method = Setting("RDKFingerprint")
+    settings: State = Setting({
+        **SmilesFormWidget.settings.default,
+        "finger_print_method": "RDKFingerprint",
+    })
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.data: Optional[Table] = None
-        self._smiles_var = None
-
-        self.smiles_model = DomainModel(
-            valid_types=(StringVariable,)
-        )
         self.finger_print_model = model = PyListModel()
+
         for i, fp in enumerate(Fingerprints):
             model.append(fp.name)
             model.setItemData(
@@ -144,14 +142,6 @@ class OWMoleculeFingerprints(OWConcurrentWidget):
                     Qt.UserRole + 2: fp.key,
                 }
             )
-
-        self.smiles_cb = ComboBoxSearch(
-            minimumContentsLength=20,
-            sizeAdjustPolicy=ComboBoxSearch.AdjustToMinimumContentsLengthWithIcon
-        )
-        self.smiles_cb.activated.connect(
-            self.__set_smiles_index
-        )
         self.finger_print_cb = ComboBox(
             minimumContentsLength=20,
             sizeAdjustPolicy=ComboBoxSearch.AdjustToMinimumContentsLengthWithIcon
@@ -159,45 +149,21 @@ class OWMoleculeFingerprints(OWConcurrentWidget):
         self.finger_print_cb.activated.connect(
             self.__set_finger_print_index
         )
-        form = QFormLayout(
-            labelAlignment=Qt.AlignLeft,
-            formAlignment=Qt.AlignLeft,
-            fieldGrowthPolicy=QFormLayout.AllNonFixedFieldsGrow,
-        )
-        form.addRow("Smiles", self.smiles_cb)
-        form.addRow("Fingerprints", self.finger_print_cb)
-        self.controlArea.layout().addLayout(form)
 
-        self.smiles_cb.setModel(self.smiles_model)
+        self.form.addRow("Fingerprints", self.finger_print_cb)
         self.finger_print_cb.setModel(self.finger_print_model)
         # Restore fingerprint
         cbselect(
-            self.finger_print_cb, self.finger_print_method, Qt.UserRole + 2,
-            default=0
+            self.finger_print_cb, self.settings["finger_print_method"],
+            Qt.UserRole + 2, default=0
         )
-
-    def __set_smiles_index(self, index: int):
-        self.smiles_cb.setCurrentIndex(index)
-        if index < 0:
-            smiles_var = None
-        else:
-            smiles_var = self.smiles_model[index]
-        if self._smiles_var != smiles_var:
-            self._smiles_var = smiles_var
-            if smiles_var is not None:
-                self.smiles_var_name = self._smiles_var.name
-            self.invalidate()
 
     def __set_finger_print_index(self, index: int):
         self.finger_print_cb.setCurrentIndex(index)
         method = self.finger_print_cb.currentData(Qt.UserRole + 2)
-        if self.finger_print_method != method:
-            self.finger_print_method = method
+        if self.settings["finger_print_method"] != method:
+            self.settings["finger_print_method"] = method
             self.invalidate()
-
-    @property
-    def smiles_var(self):
-        return self._smiles_var
 
     @Inputs.data
     def set_data(self, data):
@@ -207,21 +173,23 @@ class OWMoleculeFingerprints(OWConcurrentWidget):
     def handleNewSignals(self):
         if self.data is not None:
             self.smiles_model.set_domain(self.data.domain)
-            idx = self.smiles_cb.findText(self.smiles_var_name)
-            self.__set_smiles_index(idx)
+            idx = cb_find_smiles_column(
+                self.smiles_cb, self.settings["smiles_column"]
+            )
+            self.set_smiles_column(idx)
         else:
             self.smiles_model.set_domain(None)
         super().handleNewSignals()
 
     def commit(self):
-        if self.data is None or self.smiles_var is None:
+        if self.data is None or self.smiles_column() is None:
             self.clear_outputs()
         else:
             self.start(self.create_task())
 
     def create_task(self):
         data = self.data
-        column = self.smiles_var
+        column = self.smiles_column()
         fp = self.finger_print_cb.currentData(Qt.UserRole)
         column_name_format = self.finger_print_cb.currentData(Qt.UserRole + 1)
         return partial(run, data, column, fp, column_name_format)

@@ -1,95 +1,21 @@
 from functools import partial
-from typing import Optional, TypedDict, Union, Callable, Sequence
+from typing import Optional, Callable, Sequence
 
-from AnyQt.QtCore import Qt
-from AnyQt.QtWidgets import QComboBox, QFormLayout, QCheckBox
+from AnyQt.QtWidgets import QCheckBox
 
 from rdkit import Chem
 from rdkit.Chem import rdFMCS
 
 from orangewidget.settings import Setting
-from orangewidget.utils.combobox import ComboBoxSearch
 from orangewidget.utils.signals import Output
 
 from Orange.data import Table, StringVariable
-from Orange.widgets.utils.itemmodels import DomainModel
 from Orange.widgets.utils.concurrent import TaskState
 from Orange.widgets.utils.spinbox import DoubleSpinBox
 
-from orangecontrib.chem.widgets.common import OWConcurrentWidget, Input
-
-
-def cb_find_smiles_column(cb: QComboBox, name=None, role=Qt.DisplayRole):
-    if name is not None:
-        return cb.findData(name, role)
-    else:
-        return cb.findData("smiles", role, Qt.MatchFixedString)
-
-
-class SimpleFormWidget(OWConcurrentWidget, openclass=True):
-    want_main_area = False
-    resizing_enabled = False
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.form = QFormLayout(
-            objectName="main-form",
-            formAlignment=Qt.AlignLeft,
-            labelAlignment=Qt.AlignLeft,
-            fieldGrowthPolicy=QFormLayout.AllNonFixedFieldsGrow,
-        )
-        self.controlArea.layout().addLayout(self.form)
-
-
-class SmilesFormWidget(SimpleFormWidget, openclass=True):
-    smiles_var: Optional[StringVariable] = None
-
-    class State(TypedDict):
-        smiles_column: Optional[str]
-
-    settings: State = Setting({
-        "smiles_column": None,
-    })
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.settings = {
-            **type(self).settings.default,
-            **self.settings,
-        }
-
-        self.smiles_model = DomainModel()
-        self.smiles_cb = ComboBoxSearch(
-            objectName="smiles-cb",
-            minimumContentsLength=20,
-            sizeAdjustPolicy=ComboBoxSearch.AdjustToMinimumContentsLengthWithIcon
-        )
-        self.smiles_cb.setModel(self.smiles_model)
-        self.smiles_cb.activated.connect(self.__set_smiles_index)
-        self.form.addRow("Smiles", self.smiles_cb)
-
-    def __set_smiles_index(self, index: int):
-        self.smiles_cb.setCurrentIndex(index)
-        if index < 0:
-            smiles_var = None
-        else:
-            smiles_var = self.smiles_model[index]
-
-        if self.smiles_var != smiles_var:
-            self.smiles_var = smiles_var
-            if smiles_var is not None:
-                self.settings["smiles_column"] = smiles_var.name
-            self.invalidate()
-
-    def set_smiles_column(self, column: Union[StringVariable, int]):
-        if isinstance(column, StringVariable):
-            index = self.smiles_model.indexOf(column)
-        else:
-            index = column
-        self.__set_smiles_index(index)
-
-    def smiles_column(self) -> StringVariable:
-        return self.smiles_var
+from orangecontrib.chem.widgets.common import (
+    SmilesFormWidget, Input, cb_find_smiles_column
+)
 
 
 class OWMCS(SmilesFormWidget):
