@@ -1,11 +1,9 @@
-import numpy as np
-
 from AnyQt.QtTest import  QTest
 
-from Orange.data import Table, Domain, StringVariable
 from Orange.widgets.tests.base import WidgetTest
 
 from orangecontrib.chem.widgets.owmoleculeviewer import OWMoleculeViewer
+from orangecontrib.chem.widgets.tests import test_data
 
 
 class TestOWMoleculeViewer(WidgetTest):
@@ -14,13 +12,7 @@ class TestOWMoleculeViewer(WidgetTest):
         self.widget = self.create_widget(
             OWMoleculeViewer
         )
-        self.data = Table.from_numpy(
-            Domain([], [], [StringVariable("SMILES")]),
-            np.empty((3, 0)), None,
-            [["CC"],
-             ["Br"],
-             ["c1ccccc1"]],
-        )
+        self.data = test_data()
 
     def test_widget(self):
         self.send_signal(self.widget.Inputs.data, self.data)
