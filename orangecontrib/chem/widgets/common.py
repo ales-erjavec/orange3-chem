@@ -5,6 +5,7 @@ from typing import Any, Optional, TypedDict, Union
 from AnyQt.QtCore import QTimer, Slot, Qt, QSettings
 from AnyQt.QtWidgets import QComboBox, QFormLayout
 
+from rdkit import RDLogger
 from orangewidget import gui, settings
 from orangewidget.utils.combobox import ComboBox, ComboBoxSearch
 
@@ -88,6 +89,7 @@ class SimpleFormWidget(OWConcurrentWidget, openclass=True):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        RDLogger.DisableLog("rdApp.*")
         self.form = QFormLayout(
             objectName="main-form",
             formAlignment=Qt.AlignLeft,

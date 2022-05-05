@@ -8,7 +8,7 @@ from itertools import chain
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Sequence, Any, Iterable, Optional
 
-from rdkit import Chem
+from rdkit import Chem, RDLogger
 from rdkit.Chem import Draw
 
 from AnyQt.QtGui import QKeyEvent, QPainter, QIcon
@@ -285,6 +285,7 @@ class OWMoleculeViewer(widget.OWWidget):
 
     def __init__(self):
         super().__init__()
+        RDLogger.DisableLog("rdApp.*")
         self.data = None
         self.smarts: Optional[Chem.Mol] = None
 
