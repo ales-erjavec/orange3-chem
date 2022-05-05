@@ -376,6 +376,7 @@ class OWMoleculeViewer(widget.OWWidget):
 
             if self.stringAttrs:
                 self.setupModel()
+        self.onSelectionChanged()
 
     @Inputs.smarts
     def setSmarts(self, smarts: str):
