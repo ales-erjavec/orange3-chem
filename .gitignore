@@ -9,6 +9,7 @@ doc/_build
 *.o
 *.py[doc]
 MANIFEST
+.*
 
 # Cython generated files
 __pycache__
