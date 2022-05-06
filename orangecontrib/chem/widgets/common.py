@@ -1,6 +1,7 @@
 import abc
 import os
-from typing import Any, Optional, TypedDict, Union
+from typing import Any, Optional, Union
+from typing_extensions import TypedDict
 
 from AnyQt.QtCore import QTimer, Slot, Qt, QSettings
 from AnyQt.QtWidgets import QComboBox, QFormLayout
