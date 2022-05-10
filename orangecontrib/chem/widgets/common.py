@@ -1,12 +1,18 @@
 import abc
 import os
-from typing import Any, Optional, Union
+import concurrent.futures
+import multiprocessing
+from typing import Any, Optional, Union, Callable
 from typing_extensions import TypedDict
 
 from AnyQt.QtCore import QTimer, Slot, Qt, QSettings
 from AnyQt.QtWidgets import QComboBox, QFormLayout
 
+import psutil
+
 from rdkit import RDLogger
+
+from orangewidget.widget import OWBaseWidget
 from orangewidget import gui, settings
 from orangewidget.utils.combobox import ComboBox, ComboBoxSearch
 
@@ -22,15 +28,58 @@ Output = Output
 Msg = Msg
 
 
-class OWConcurrentWidget(OWWidget, ConcurrentWidgetMixin, openclass=True):
+class ConcurrentWidget(OWBaseWidget, ConcurrentWidgetMixin, openclass=True):
+    def __init__(self, *args, **kwargs):
+        OWBaseWidget.__init__(self)
+        ConcurrentWidgetMixin.__init__(self)
+
+
+class ProcessPoolWidget(ConcurrentWidget):
+    __process_executor = None
+    __process_executor_ref = 0
+
+    @staticmethod
+    def __get_process_pool():
+        if ProcessPoolWidget.__process_executor is None:
+            executor = concurrent.futures.ProcessPoolExecutor(
+                max_workers=max(psutil.cpu_count(logical=False) - 1, 1),
+                mp_context=multiprocessing.get_context("spawn")
+            )
+            ProcessPoolWidget.__process_executor = executor
+        ProcessPoolWidget.__process_executor_ref += 1
+        return ProcessPoolWidget.__process_executor
+
+    @staticmethod
+    def __release_process_pool():
+        ProcessPoolWidget.__process_executor_ref -= 1
+        if ProcessPoolWidget.__process_executor_ref <= 0:
+            ProcessPoolWidget.__process_executor.shutdown()
+            ProcessPoolWidget.__process_executor = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.__process_executor = ProcessPoolWidget.__get_process_pool()
+
+    def process_executor(self):
+        return self.__process_executor
+
+    def start(self, task: Callable, *args, **kwargs):
+        super().start(task, *args, self.process_executor(), **kwargs)
+
+    def onDeleteWidget(self):
+        super().onDeleteWidget()
+        self.__release_process_pool()
+        del self.__process_executor
+
+
+class OWConcurrentWidget(OWWidget, ConcurrentWidget, openclass=True):
     auto_commit: bool = Setting(False)
 
     class Error(OWWidget.Error):
         unhandled_error = Msg("Unhandled exception")
 
-    def __init__(self):
-        OWWidget.__init__(self)
-        ConcurrentWidgetMixin.__init__(self)
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.__modified = False
         self.__commit_timer = QTimer(singleShot=True, interval=0)
         self.__commit_timer.timeout.connect(self.__do_commit)

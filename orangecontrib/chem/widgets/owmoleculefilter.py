@@ -1,6 +1,6 @@
 from functools import partial
 from typing import Optional
-from concurrent.futures import CancelledError
+from concurrent.futures import CancelledError, Executor
 
 import numpy as np
 from rdkit import Chem
@@ -22,13 +22,13 @@ from Orange.widgets.utils.annotated_data import (
 )
 from orangecontrib.chem.widgets.common import (
     OWConcurrentWidget, Input, Output, Msg, TextEditComboBox, local_settings,
-    SmilesFormWidget, cb_find_smiles_column,
+    SmilesFormWidget, ProcessPoolWidget, cb_find_smiles_column,
 )
 
 MAX_HISTORY = 30
 
 
-class OWMoleculeFilter(SmilesFormWidget):
+class OWMoleculeFilter(SmilesFormWidget, ProcessPoolWidget):
     name = "Molecule Filter"
     description = "Filter molecules based on SMARTS patterns"
     icon = "icons/category.svg"
@@ -174,27 +174,36 @@ class InvalidSmartsPattern(ValueError):
     pass
 
 
-def run(data, column, pattern, state: TaskState):
-    coldata = data[:, column].metas.flatten()
+def matches(smi: str, patt: Chem.Mol) -> bool:
+    if not smi:
+        return False
+    mol = Chem.MolFromSmiles(smi)
+    if mol is None:
+        return False
+    match = mol.GetSubstructMatch(patt)
+    return bool(match)
+
+
+def run(data, column, pattern,  executor: Executor, state: TaskState):
+    coldata = data[:, column].metas.flatten().tolist()
+    N = len(coldata)
     patt = Chem.MolFromSmarts(pattern)
     if patt is None:
         raise InvalidSmartsPattern()
-    N = len(coldata)
-    matches = [False] * N
-    for i, smiles in enumerate(coldata):
-        if not smiles:
-            continue
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            matches[i] = False
-        else:
-            match = mol.GetSubstructMatch(patt)
-            matches[i] = bool(match)
-        state.set_progress_value(100. * i // N)
-        if state.is_interruption_requested():
-            raise CancelledError()
+    res_arr = [False] * N
+    res = executor.map(
+        partial(matches, patt=patt), coldata, chunksize=512
+    )
+    try:
+        for i, match in enumerate(res):
+            res_arr[i] = bool(match)
+            state.set_progress_value(100. * i // N)
+            if state.is_interruption_requested():
+                raise CancelledError()
+    finally:
+        res.close()
 
-    matches = np.array(matches, bool)
-    selected = data[matches]
-    annotated = create_annotated_table(data, matches)
+    res_arr = np.array(res_arr, bool)
+    selected = data[res_arr]
+    annotated = create_annotated_table(data, res_arr)
     return selected, annotated

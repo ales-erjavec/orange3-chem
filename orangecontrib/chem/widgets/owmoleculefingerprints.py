@@ -1,7 +1,8 @@
+from types import GeneratorType
 from typing import Optional, List, Sequence, Callable
 from dataclasses import dataclass
 from functools import partial
-from concurrent.futures import CancelledError
+from concurrent.futures import CancelledError, Executor
 
 from rdkit import Chem
 from rdkit.Chem import MACCSkeys, AllChem
@@ -20,7 +21,7 @@ from Orange.widgets.widget import Input, Output
 from Orange.widgets.settings import Setting
 
 from orangecontrib.chem.widgets.common import (
-    SmilesFormWidget, cbselect, cb_find_smiles_column
+    SmilesFormWidget, cbselect, cb_find_smiles_column, ProcessPoolWidget
 )
 
 
@@ -31,10 +32,34 @@ class Result:
 
 def fingerprint_from_smiles(
         smiles: str, fingerprint: Callable = Chem.RDKFingerprint
-) -> List[float]:
-    mol = Chem.MolFromSmiles(smiles)
-    fp = fingerprint(mol)
-    return list(fp)
+) -> Optional[List[float]]:
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+    except Exception:
+        return None
+    else:
+        if mol:
+            fp = fingerprint(mol)
+            return list(fp)
+    return None
+
+
+def fingerprints(smiles: Sequence[str], fingerprint, progress, executor: Executor):
+    size = len(smiles)
+    fps: List[Optional[Sequence[float]]] = [None] * size
+    Fs = executor.map(
+        partial(fingerprint_from_smiles, fingerprint=fingerprint),
+        smiles,
+        chunksize=127,
+    )
+    assert isinstance(Fs, GeneratorType)
+    try:
+        for i, res in enumerate(Fs):
+            fps[i] = res
+            progress(100 * (i + 1) / size)
+    finally:
+        Fs.close()
+    return fps
 
 
 def run(
@@ -42,22 +67,15 @@ def run(
         column: StringVariable,
         fingerprint: Callable,
         column_name_format: str,
+        executor: Executor,
         state: TaskState
 ) -> Result:
-    smiles = data[:, column].metas.flatten()
-    size = len(smiles)
-    fps: List[Optional[Sequence[float]]] = [None] * size
-    for i, sm in enumerate(smiles):
-        if sm:
-            try:
-                res = fingerprint_from_smiles(sm, fingerprint)
-            except Exception:
-                pass
-            else:
-                fps[i] = res
-        state.set_progress_value(100 * (i + 1) / size)
+    def progress(value):
+        state.set_progress_value(value)
         if state.is_interruption_requested():
-            raise CancelledError()
+            raise CancelledError
+    smiles = data[:, column].metas.flatten().tolist()
+    fps = fingerprints(smiles, fingerprint, progress, executor)
     data = table_concat_fingerprints(data, fps, column_name_format, 1)
     return Result(data)
 
@@ -86,6 +104,22 @@ def table_concat_fingerprints(
     return table.concatenate([table, extend], axis=1)
 
 
+def RDKFingerprint(mol):
+    return Chem.RDKFingerprint(mol)
+
+
+def GenMACCSKeys(mol):
+    return MACCSkeys.GenMACCSKeys(mol)
+
+
+def GetMorganFingerprint(mol):
+    return AllChem.GetMorganFingerprintAsBitVect(mol, 2),
+
+
+def GetMorganFingerprint_useFeatures(mol):
+    return AllChem.GetMorganFingerprintAsBitVect(mol, 2, useFeatures=True)
+
+
 @dataclass
 class FPMethod:
     key: str
@@ -95,21 +129,19 @@ class FPMethod:
 
 
 Fingerprints = [
-    FPMethod("RDKFingerprint", "RDK Fingerprint", Chem.RDKFingerprint, "RDF-{}"),
-    FPMethod("GenMACCSKeys", "MACCS Keys", MACCSkeys.GenMACCSKeys, "MACCS-{}"),
+    FPMethod("RDKFingerprint", "RDK Fingerprint", RDKFingerprint, "RDF-{}"),
+    FPMethod("GenMACCSKeys", "MACCS Keys", GenMACCSKeys, "MACCS-{}"),
     FPMethod("GetMorganFingerprint", "Morgan Fingerprint (ECFP4 like)",
-             lambda mol: AllChem.GetMorganFingerprintAsBitVect(mol, 2),
+             GetMorganFingerprint,
              "M-{}"),
     FPMethod("GetMorganFingerprint_useFeatures",
              "Feature Morgan Fingerprint (FCFP4 like)",
-             lambda mol: AllChem.GetMorganFingerprintAsBitVect(
-                 mol, 2, useFeatures=True
-             ),
+             GetMorganFingerprint_useFeatures,
              "M-{}")
 ]
 
 
-class OWMoleculeFingerprints(SmilesFormWidget):
+class OWMoleculeFingerprints(SmilesFormWidget, ProcessPoolWidget):
     name = "Molecule Fingerprints"
     description = "Compute molecule fingerprints"
     icon = "../widgets/icons/category.svg"
