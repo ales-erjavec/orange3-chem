@@ -4,8 +4,6 @@ from dataclasses import dataclass
 from functools import partial
 from concurrent.futures import CancelledError, Executor
 
-from rdkit import Chem
-from rdkit.Chem import MACCSkeys, AllChem
 from rdkit.DataStructs import ExplicitBitVect
 
 import numpy as np
@@ -23,25 +21,16 @@ from Orange.widgets.settings import Setting
 from orangecontrib.chem.widgets.common import (
     SmilesFormWidget, cbselect, cb_find_smiles_column, ProcessPoolWidget
 )
+from orangecontrib.chem.widgets._fingerprints import (
+    fingerprint_from_smiles,
+    RDKFingerprint, GenMACCSKeys, GetMorganFingerprint,
+    GetMorganFingerprint_useFeatures,
+)
 
 
 @dataclass
 class Result:
     data: Table
-
-
-def fingerprint_from_smiles(
-        smiles: str, fingerprint: Callable = Chem.RDKFingerprint
-) -> Optional[List[float]]:
-    try:
-        mol = Chem.MolFromSmiles(smiles)
-    except Exception:
-        return None
-    else:
-        if mol:
-            fp = fingerprint(mol)
-            return list(fp)
-    return None
 
 
 def fingerprints(smiles: Sequence[str], fingerprint, progress, executor: Executor):
@@ -103,21 +92,6 @@ def table_concat_fingerprints(
     extend = Table.from_numpy(Domain(cols), fp_array)
     return table.concatenate([table, extend], axis=1)
 
-
-def RDKFingerprint(mol):
-    return Chem.RDKFingerprint(mol)
-
-
-def GenMACCSKeys(mol):
-    return MACCSkeys.GenMACCSKeys(mol)
-
-
-def GetMorganFingerprint(mol):
-    return AllChem.GetMorganFingerprintAsBitVect(mol, 2),
-
-
-def GetMorganFingerprint_useFeatures(mol):
-    return AllChem.GetMorganFingerprintAsBitVect(mol, 2, useFeatures=True)
 
 
 @dataclass

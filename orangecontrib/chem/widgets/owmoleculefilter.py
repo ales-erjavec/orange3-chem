@@ -1,4 +1,5 @@
 from functools import partial
+from types import GeneratorType
 from typing import Optional
 from concurrent.futures import CancelledError, Executor
 
@@ -24,6 +25,7 @@ from orangecontrib.chem.widgets.common import (
     OWConcurrentWidget, Input, Output, Msg, TextEditComboBox, local_settings,
     SmilesFormWidget, ProcessPoolWidget, cb_find_smiles_column,
 )
+from orangecontrib.chem.widgets._moleculefilter import matches
 
 MAX_HISTORY = 30
 
@@ -174,16 +176,6 @@ class InvalidSmartsPattern(ValueError):
     pass
 
 
-def matches(smi: str, patt: Chem.Mol) -> bool:
-    if not smi:
-        return False
-    mol = Chem.MolFromSmiles(smi)
-    if mol is None:
-        return False
-    match = mol.GetSubstructMatch(patt)
-    return bool(match)
-
-
 def run(data, column, pattern,  executor: Executor, state: TaskState):
     coldata = data[:, column].metas.flatten().tolist()
     N = len(coldata)
@@ -194,6 +186,7 @@ def run(data, column, pattern,  executor: Executor, state: TaskState):
     res = executor.map(
         partial(matches, patt=patt), coldata, chunksize=512
     )
+    assert isinstance(res, GeneratorType)
     try:
         for i, match in enumerate(res):
             res_arr[i] = bool(match)
