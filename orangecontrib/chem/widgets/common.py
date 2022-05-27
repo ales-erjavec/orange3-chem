@@ -38,7 +38,7 @@ class ConcurrentWidget(OWBaseWidget, ConcurrentWidgetMixin, openclass=True):
         super().onDeleteWidget()
 
 
-class ProcessPoolWidget(ConcurrentWidget):
+class ProcessPoolWidget(ConcurrentWidget, openclass=True):
     __process_executor = None
     __process_executor_ref = 0
 
