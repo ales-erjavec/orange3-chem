@@ -33,6 +33,10 @@ class ConcurrentWidget(OWBaseWidget, ConcurrentWidgetMixin, openclass=True):
         OWBaseWidget.__init__(self)
         ConcurrentWidgetMixin.__init__(self)
 
+    def onDeleteWidget(self):
+        self.shutdown()
+        super().onDeleteWidget()
+
 
 class ProcessPoolWidget(ConcurrentWidget):
     __process_executor = None
