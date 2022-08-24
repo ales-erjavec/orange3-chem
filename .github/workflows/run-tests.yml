@@ -33,6 +33,11 @@ jobs:
             python-version: "3.10"
             test-env: "PyQt5~=5.15.0 PyQtWebEngine~=5.15.0"
 
+          - os: ubuntu-20.04
+            python-version: "3.10"
+            test-env: "PyQt6~=6.2.3 PyQt6-Qt6~=6.2.3 PyQt6-WebEngine~=6.2.1 PyQt6-WebEngine-Qt6~=6.2.1"
+            qt-api: "PyQt6"
+
           # macOS
           - os: macos-11
             python-version: 3.8
@@ -62,6 +67,11 @@ jobs:
           - os: windows-2019
             python-version: "3.10"
             test-env: "PyQt5~=5.15.0 PyQtWebEngine~=5.15.0"
+
+          - os: windows-2019
+            python-version: "3.10"
+            test-env: "PyQt6~=6.2.3 PyQt6-Qt6~=6.2.3 PyQt6-WebEngine~=6.2.1 PyQt6-WebEngine-Qt6~=6.2.1"
+            qt-api: "PyQt6"
 
     steps:
       - uses: actions/checkout@v2
@@ -101,11 +111,14 @@ jobs:
 
       - name: Run Tests
         if: ${{ !startsWith(runner.os, 'Linux') }}
+        env:
+          QT_API: ${{ matrix.qt-api }}
         run: coverage run -m unittest -v
 
       - name: Run Tests with Xvfb
         if: ${{ startsWith(runner.os, 'Linux') }}
         env:
+          QT_API: ${{ matrix.qt-api }}
           XVFBARGS: "-screen 0 1280x1024x24"
         run: catchsegv xvfb-run -a -s "$XVFBARGS" coverage run -m unittest  -v
 
