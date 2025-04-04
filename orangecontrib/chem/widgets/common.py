@@ -105,6 +105,7 @@ class OWConcurrentWidget(OWWidget, ConcurrentWidget, openclass=True):
         font = self.commit_button.font()
         font.setItalic(state)
         self.commit_button.setFont(font)
+        self.commit_button.setEnabled(state)
 
     def invalidate(self):
         self.cancel()
