@@ -204,25 +204,6 @@ class SmilesFormWidget(SimpleFormWidget, openclass=True):
         return self.smiles_var
 
 
-class TextEditComboBox(ComboBox):
-    def text(self) -> str:
-        """
-        Return the current text.
-        """
-        return self.itemText(self.currentIndex())
-
-    def setText(self, text: str) -> None:
-        """
-        Set `text` as the current text (adding it to the model if necessary).
-        """
-        idx = self.findData(text, Qt.EditRole, Qt.MatchExactly)
-        if idx != -1:
-            self.setCurrentIndex(idx)
-        else:
-            self.addItem(text)
-            self.setCurrentIndex(self.count() - 1)
-
-
 def cbselect(
         cb: QComboBox, value, role: Qt.ItemDataRole = Qt.EditRole, default=-1
 ) -> None:

@@ -21,8 +21,9 @@ from Orange.widgets.utils.concurrent import TaskState
 from Orange.widgets.utils.annotated_data import (
     create_annotated_table, ANNOTATED_DATA_SIGNAL_NAME
 )
+from Orange.widgets.utils.combobox import TextEditCombo
 from orangecontrib.chem.widgets.common import (
-    OWConcurrentWidget, Input, Output, Msg, TextEditComboBox, local_settings,
+    OWConcurrentWidget, Input, Output, Msg, local_settings,
     SmilesFormWidget, ProcessPoolWidget, cb_find_smiles_column,
 )
 from orangecontrib.chem.widgets._moleculefilter import matches
@@ -58,17 +59,17 @@ class OWMoleculeFilter(SmilesFormWidget, ProcessPoolWidget):
         super().__init__(*args, **kwargs)
         self.data: Optional[Table] = None
         self.filter_model = PyListModel()
-        self.filter_cb = TextEditComboBox(
+        self.filter_cb = TextEditCombo(
             minimumContentsLength=40,
             sizeAdjustPolicy=ComboBoxSearch.AdjustToMinimumContentsLengthWithIcon,
-            insertPolicy=TextEditComboBox.InsertAtTop,
+            insertPolicy=TextEditCombo.InsertAtTop,
             editable=True,
         )
         self.filter_cb.lineEdit().setPlaceholderText("SMARTS pattern...")
         self.form.addRow("Filter", self.filter_cb)
 
         self.filter_cb.setModel(self.filter_model)
-        self.filter_cb.activated.connect(self.__filter_changed)
+        self.filter_cb.editingFinished.connect(self.__filter_changed)
         self.restore()
         # TODO: Pre-populate filter_model with
         #  rdkit/Data/Functional_Group_Hierarchy.txt
